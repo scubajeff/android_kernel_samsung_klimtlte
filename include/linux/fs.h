@@ -1,6 +1,11 @@
 #ifndef _LINUX_FS_H
 #define _LINUX_FS_H
-
+/* @daniel, backport form 3.13-1
+ * some versions don't have this and thus don't
+ * include it from the original fs.h
+ */
+#include <linux/uidgid.h>
+// @
 /*
  * This file has definitions for some important file table
  * structures etc.

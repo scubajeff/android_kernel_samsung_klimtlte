@@ -28,6 +28,14 @@ struct seq_file {
 	void *private;
 };
 
+// @daniel, backport 3.31-1
+static inline struct user_namespace *seq_user_ns(struct seq_file *seq)
+{
+	extern struct user_namespace init_user_ns;
+	return &init_user_ns;
+}
+// @
+
 struct seq_operations {
 	void * (*start) (struct seq_file *m, loff_t *pos);
 	void (*stop) (struct seq_file *m, void *v);
