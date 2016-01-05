@@ -21,7 +21,7 @@
  * software in any way with any other Broadcom software provided under a license
  * other than the GPL, without Broadcom's express prior written consent.
  *
- * $Id: wl_cfgp2p.c 454364 2014-02-10 09:20:25Z $
+ * $Id: wl_cfgp2p.c 519153 2014-12-05 05:10:07Z $
  *
  */
 #include <typedefs.h>
@@ -41,6 +41,7 @@
 #include <bcmendian.h>
 #include <proto/ethernet.h>
 #include <proto/802.11.h>
+#include <net/rtnetlink.h>
 
 #include <wl_cfg80211.h>
 #include <wl_cfgp2p.h>
@@ -980,7 +981,7 @@ wl_cfgp2p_act_frm_search(struct bcm_cfg80211 *cfg, struct net_device *ndev,
 	p2p_scan_purpose_t p2p_scan_purpose = P2P_SCAN_AFX_PEER_NORMAL;
 	if (!p2p_is_on(cfg) || ndev == NULL || bssidx == WL_INVALID)
 		return -BCME_ERROR;
-	CFGP2P_ERR((" Enter\n"));
+	WL_TRACE_HW4((" Enter\n"));
 	if (bssidx == wl_to_p2p_bss_bssidx(cfg, P2PAPI_BSSCFG_PRIMARY))
 		bssidx = wl_to_p2p_bss_bssidx(cfg, P2PAPI_BSSCFG_DEVICE);
 	if (channel)
@@ -1179,6 +1180,12 @@ wl_cfgp2p_set_management_ie(struct bcm_cfg80211 *cfg, struct net_device *ndev, s
 				mgmt_ie_buf = cfg->ap_info->beacon_ie;
 				mgmt_ie_len = &cfg->ap_info->beacon_ie_len;
 				mgmt_ie_buf_len = sizeof(cfg->ap_info->beacon_ie);
+				break;
+			case VNDR_IE_ASSOCRSP_FLAG :
+				/* WPS-AP WSC2.0 assoc res includes wps_ie */
+				mgmt_ie_buf = cfg->ap_info->assoc_res_ie;
+				mgmt_ie_len = &cfg->ap_info->assoc_res_ie_len;
+				mgmt_ie_buf_len = sizeof(cfg->ap_info->assoc_res_ie);
 				break;
 			default:
 				mgmt_ie_buf = NULL;
@@ -1633,10 +1640,11 @@ wl_cfgp2p_listen_complete(struct bcm_cfg80211 *cfg, bcm_struct_cfgdev *cfgdev,
 #endif /* WL_CFG80211_VSDB_PRIORITIZE_SCAN_REQUEST */
 			if (ndev && (ndev->ieee80211_ptr != NULL)) {
 #if defined(WL_CFG80211_P2P_DEV_IF)
-				cfg80211_remain_on_channel_expired(cfgdev, cfg->last_roc_id,
+				cfg80211_remain_on_channel_expired(
+					bcmcfg_to_p2p_wdev(cfg), cfg->last_roc_id,
 					&cfg->remain_on_chan, GFP_KERNEL);
 #else
-				cfg80211_remain_on_channel_expired(cfgdev, cfg->last_roc_id,
+				cfg80211_remain_on_channel_expired(cfg->p2p_net, cfg->last_roc_id,
 					&cfg->remain_on_chan, cfg->remain_on_chan_type, GFP_KERNEL);
 #endif /* WL_CFG80211_P2P_DEV_IF */
 			}
@@ -1690,16 +1698,19 @@ wl_cfgp2p_cancel_listen(struct bcm_cfg80211 *cfg, struct net_device *ndev,
 #endif /* NOT_YET */
 	if (timer_pending(&cfg->p2p->listen_timer)) {
 		del_timer_sync(&cfg->p2p->listen_timer);
-		if (notify)
-			if (ndev && ndev->ieee80211_ptr) {
+		if (notify) {
 #if defined(WL_CFG80211_P2P_DEV_IF)
-				cfg80211_remain_on_channel_expired(wdev, cfg->last_roc_id,
+			if (wdev)
+				cfg80211_remain_on_channel_expired(
+					bcmcfg_to_p2p_wdev(cfg), cfg->last_roc_id,
 					&cfg->remain_on_chan, GFP_KERNEL);
 #else
-				cfg80211_remain_on_channel_expired(ndev, cfg->last_roc_id,
+			if (ndev && ndev->ieee80211_ptr) {
+				cfg80211_remain_on_channel_expired(cfg->p2p_net, cfg->last_roc_id,
 					&cfg->remain_on_chan, cfg->remain_on_chan_type, GFP_KERNEL);
-#endif /* WL_CFG80211_P2P_DEV_IF */
 			}
+#endif /* WL_CFG80211_P2P_DEV_IF */
+		}
 	}
 	return 0;
 }
@@ -1820,6 +1831,10 @@ wl_cfgp2p_action_tx_complete(struct bcm_cfg80211 *cfg, bcm_struct_cfgdev *cfgdev
 			if (status == WLC_E_STATUS_SUCCESS) {
 				wl_set_p2p_status(cfg, ACTION_TX_COMPLETED);
 				CFGP2P_DBG(("WLC_E_ACTION_FRAME_COMPLETE : ACK\n"));
+				if (!cfg->need_wait_afrx && cfg->af_sent_channel) {
+					CFGP2P_DBG(("no need to wait next AF.\n"));
+					wl_stop_wait_next_action_frame(cfg, ndev);
+				}
 			}
 			else if (!wl_get_p2p_status(cfg, ACTION_TX_COMPLETED)) {
 				wl_set_p2p_status(cfg, ACTION_TX_NOACK);
@@ -1885,6 +1900,9 @@ wl_cfgp2p_tx_action_frame(struct bcm_cfg80211 *cfg, struct net_device *dev,
 
 	if (timeout >= 0 && wl_get_p2p_status(cfg, ACTION_TX_COMPLETED)) {
 		CFGP2P_INFO(("tx action frame operation is completed\n"));
+		ret = BCME_OK;
+	} else if (ETHER_ISBCAST(&cfg->afx_hdl->tx_dst_addr)) {
+		CFGP2P_INFO(("bcast tx action frame operation is completed\n"));
 		ret = BCME_OK;
 	} else {
 		ret = BCME_ERROR;
@@ -2677,6 +2695,9 @@ wl_cfgp2p_stop_p2p_device(struct wiphy *wiphy, struct wireless_dev *wdev)
 		CFGP2P_ERR(("P2P scan stop failed, ret=%d\n", ret));
 	}
 
+	if (!cfg->p2p)
+		return;
+
 	ret = wl_cfgp2p_disable_discovery(cfg);
 	if (unlikely(ret < 0)) {
 		CFGP2P_ERR(("P2P disable discovery failed, ret=%d\n", ret));
@@ -2692,12 +2713,22 @@ wl_cfgp2p_stop_p2p_device(struct wiphy *wiphy, struct wireless_dev *wdev)
 int
 wl_cfgp2p_del_p2p_disc_if(struct wireless_dev *wdev, struct bcm_cfg80211 *cfg)
 {
+	bool rollback_lock = false;
+
 	if (!wdev)
 		return -EINVAL;
 
 	WL_TRACE(("Enter\n"));
 
+	if (!rtnl_is_locked()) {
+		rtnl_lock();
+		rollback_lock = true;
+	}
+
 	cfg80211_unregister_wdev(wdev);
+
+	if (rollback_lock)
+		rtnl_unlock();
 
 	kfree(wdev);
 
@@ -2709,3 +2740,41 @@ wl_cfgp2p_del_p2p_disc_if(struct wireless_dev *wdev, struct bcm_cfg80211 *cfg)
 	return 0;
 }
 #endif /* WL_CFG80211_P2P_DEV_IF */
+
+void
+wl_cfgp2p_need_wait_actfrmae(struct bcm_cfg80211 *cfg, void *frame, u32 frame_len, bool tx)
+{
+	wifi_p2p_pub_act_frame_t *pact_frm;
+	int status = 0;
+
+	if (!frame || (frame_len < (sizeof(*pact_frm) + WL_P2P_AF_STATUS_OFFSET - 1))) {
+		return;
+	}
+
+	if (wl_cfgp2p_is_pub_action(frame, frame_len)) {
+		pact_frm = (wifi_p2p_pub_act_frame_t *)frame;
+		if (pact_frm->subtype == P2P_PAF_GON_RSP && tx) {
+			CFGP2P_ACTION(("Check TX P2P Group Owner Negotiation Rsp Frame status\n"));
+			status = pact_frm->elts[WL_P2P_AF_STATUS_OFFSET];
+			if (status) {
+				cfg->need_wait_afrx = false;
+				return;
+			}
+		}
+	}
+
+	cfg->need_wait_afrx = true;
+	return;
+}
+
+int
+wl_cfgp2p_is_p2p_specific_scan(struct cfg80211_scan_request *request)
+{
+	if (request && (request->n_ssids == 1) &&
+		(request->n_channels == 1) &&
+		IS_P2P_SSID(request->ssids[0].ssid, WL_P2P_WILDCARD_SSID_LEN) &&
+		(request->ssids[0].ssid_len > WL_P2P_WILDCARD_SSID_LEN)) {
+		return true;
+	}
+	return false;
+}
