@@ -176,7 +176,7 @@ fw-shipped-$(CONFIG_N2A) += tsp_atmel/mXT1664S_n.fw
 endif
 
 else
-$(warning '$(TSPFIRMWARE_DIRECTORY)' directory dose not exist)
+#$(warning '$(TSPFIRMWARE_DIRECTORY)' directory dose not exist)
 endif
 
 TSPFIRMWARE_DIRECTORY = firmware/tsp_synaptics
